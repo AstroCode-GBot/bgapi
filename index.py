@@ -21,19 +21,26 @@ MAX_UPLOAD_BYTES: Final[int] = int(os.getenv("MAX_UPLOAD_BYTES", str(4 * 1024 * 
 ALLOWED_MIME_TYPES: Final[set[str]] = {"image/jpeg", "image/png", "image/webp"}
 ALLOWED_PIL_FORMATS: Final[set[str]] = {"JPEG", "PNG", "WEBP"}
 HEX_COLOR_RE: Final[re.Pattern[str]] = re.compile(r"^#[0-9a-fA-F]{6}$")
-MODEL_FILENAME: Final[str] = "model_fp16.onnx"
-MODEL_URL: Final[str] = os.getenv(
-    "MODEL_URL",
+# The ~490 MB BiRefNet FP16 export is intended for FP16-capable hardware.
+# ONNX Runtime documents that its CPU implementation does not support FP16 ops,
+# so CPU deployments use the FP32 export automatically. CUDA deployments use FP16.
+DEFAULT_MODEL_DIR = Path(os.getenv("MODEL_DIR", "/tmp/background-remover-models"))
+MODEL_INPUT_SIZE: Final[tuple[int, int]] = (1024, 1024)
+
+FP16_MODEL_FILENAME: Final[str] = "model_fp16.onnx"
+FP16_MODEL_URL: Final[str] = os.getenv(
+    "MODEL_FP16_URL",
     "https://huggingface.co/onnx-community/BiRefNet-ONNX/resolve/main/onnx/model_fp16.onnx?download=true",
 )
-# Use MODEL_DIR when a persistent disk is available (for example on Render).
-# On serverless platforms, /tmp is the writable cache directory.
-DEFAULT_MODEL_DIR = Path(os.getenv("MODEL_DIR", "/tmp/background-remover-models"))
-MODEL_PATH: Final[Path] = DEFAULT_MODEL_DIR / MODEL_FILENAME
-MODEL_SIZE_BYTES: Final[int] = 490 * 1024 * 1024
-MODEL_INPUT_SIZE: Final[tuple[int, int]] = (1024, 1024)
+FP32_MODEL_FILENAME: Final[str] = "model.onnx"
+FP32_MODEL_URL: Final[str] = os.getenv(
+    "MODEL_FP32_URL",
+    "https://huggingface.co/onnx-community/BiRefNet-ONNX/resolve/main/onnx/model.onnx?download=true",
+)
+
 _session: ort.InferenceSession | None = None
 _model_lock = __import__("threading").Lock()
+_active_model: str | None = None
 
 app = FastAPI(
     title="Background Remover API",
@@ -91,40 +98,68 @@ def apply_background(image: Image.Image, mode: str, color: str) -> bytes:
     return output.getvalue()
 
 
-def ensure_model() -> Path:
-    """Download the BiRefNet FP16 ONNX model once if it is not cached."""
-    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+def _cuda_available() -> bool:
+    try:
+        return "CUDAExecutionProvider" in ort.get_available_providers()
+    except Exception:
+        return False
 
-    if MODEL_PATH.is_file() and MODEL_PATH.stat().st_size > 400 * 1024 * 1024:
-        return MODEL_PATH
 
-    temp_path = MODEL_PATH.with_suffix(".download")
+def _model_config() -> tuple[str, str, bool]:
+    if _cuda_available():
+        return FP16_MODEL_FILENAME, FP16_MODEL_URL, True
+    return FP32_MODEL_FILENAME, FP32_MODEL_URL, False
+
+
+def ensure_model() -> tuple[Path, bool]:
+    DEFAULT_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+    filename, url, using_cuda = _model_config()
+    model_path = DEFAULT_MODEL_DIR / filename
+
+    minimum_size = 400 * 1024 * 1024 if using_cuda else 800 * 1024 * 1024
+
+    if model_path.is_file() and model_path.stat().st_size >= minimum_size:
+        return model_path, using_cuda
+
+    temp_path = model_path.with_suffix(".download")
     if temp_path.exists():
         try:
             temp_path.unlink()
         except OSError:
             pass
 
-    LOGGER.info("Downloading BiRefNet FP16 model from Hugging Face...")
-    request = urllib.request.Request(
-        MODEL_URL,
-        headers={"User-Agent": "background-remover-api/2.0"},
+    LOGGER.info(
+        "Downloading BiRefNet %s model from Hugging Face",
+        "FP16/CUDA" if using_cuda else "FP32/CPU",
     )
+
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "RE.REMOVE-background-remover/3.0"},
+    )
+
     try:
-        with urllib.request.urlopen(request, timeout=120) as response, temp_path.open("wb") as output:
+        with urllib.request.urlopen(request, timeout=600) as response, temp_path.open("wb") as output:
             total = int(response.headers.get("Content-Length", "0") or 0)
             downloaded = 0
+
             while True:
                 chunk = response.read(8 * 1024 * 1024)
                 if not chunk:
                     break
                 output.write(chunk)
                 downloaded += len(chunk)
+
                 if total and downloaded % (64 * 1024 * 1024) < len(chunk):
                     LOGGER.info("BiRefNet download: %.0f%%", downloaded * 100 / total)
-        if downloaded < 400 * 1024 * 1024:
-            raise RuntimeError(f"Downloaded model is unexpectedly small: {downloaded} bytes")
-        temp_path.replace(MODEL_PATH)
+
+        if downloaded < minimum_size:
+            raise RuntimeError(
+                f"Downloaded model is unexpectedly small: {downloaded} bytes"
+            )
+
+        temp_path.replace(model_path)
     except Exception:
         try:
             temp_path.unlink()
@@ -132,27 +167,50 @@ def ensure_model() -> Path:
             pass
         raise
 
-    return MODEL_PATH
+    return model_path, using_cuda
 
 
 def get_session() -> ort.InferenceSession:
-    global _session
+    global _session, _active_model
+
     if _session is not None:
         return _session
+
     with _model_lock:
         if _session is not None:
             return _session
-        model_path = ensure_model()
-        LOGGER.info("Loading BiRefNet ONNX model: %s", model_path)
+
+        model_path, using_cuda = ensure_model()
+
+        session_options = ort.SessionOptions()
+        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        session_options.intra_op_num_threads = max(
+            1, int(os.getenv("ORT_INTRA_OP_THREADS", str(os.cpu_count() or 2)))
+        )
+        session_options.inter_op_num_threads = max(
+            1, int(os.getenv("ORT_INTER_OP_THREADS", "1"))
+        )
+
+        providers = (
+            ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            if using_cuda
+            else ["CPUExecutionProvider"]
+        )
+
         _session = ort.InferenceSession(
             str(model_path),
-            providers=["CPUExecutionProvider"],
+            sess_options=session_options,
+            providers=providers,
         )
+        _active_model = model_path.name
+
         LOGGER.info(
-            "BiRefNet loaded. input=%s output=%s",
+            "BiRefNet loaded. providers=%s input=%s output=%s",
+            _session.get_providers(),
             [(x.name, x.shape, x.type) for x in _session.get_inputs()],
             [(x.name, x.shape, x.type) for x in _session.get_outputs()],
         )
+
     return _session
 
 
@@ -163,11 +221,11 @@ def _sigmoid(values: np.ndarray) -> np.ndarray:
 
 def remove_background(image_bytes: bytes, mode: str, color: str) -> bytes:
     session = get_session()
+
     with Image.open(io.BytesIO(image_bytes)) as source:
         original = source.convert("RGB")
         original_size = original.size
 
-        # BiRefNet official processor: resize to 1024x1024 and ImageNet normalization.
         resized = original.resize(MODEL_INPUT_SIZE, Image.Resampling.BILINEAR)
         pixels = np.asarray(resized, dtype=np.float32) / 255.0
         pixels = (
@@ -177,26 +235,45 @@ def remove_background(image_bytes: bytes, mode: str, color: str) -> bytes:
 
         input_meta = session.get_inputs()[0]
         input_name = input_meta.name
-        # The FP16 export can accept float16; use the graph's declared input type.
-        if "float16" in input_meta.type.lower():
-            tensor = tensor.astype(np.float16)
-        else:
-            tensor = tensor.astype(np.float32)
+        tensor = tensor.astype(
+            np.float16 if "float16" in input_meta.type.lower() else np.float32
+        )
 
-        output_meta = session.get_outputs()[0]
-        prediction = session.run([output_meta.name], {input_name: tensor})[0]
+        try:
+            outputs = session.run(None, {input_name: tensor})
+        except Exception as exc:
+            LOGGER.exception("BiRefNet inference failed")
+            raise RuntimeError(
+                f"BiRefNet inference failed: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        if not outputs:
+            raise RuntimeError("BiRefNet returned no output tensors")
+
+        output_names = [item.name for item in session.get_outputs()]
+        prediction = (
+            outputs[output_names.index("output_image")]
+            if "output_image" in output_names
+            else outputs[0]
+        )
         prediction = np.asarray(prediction)
 
-        # Official BiRefNet ONNX usage applies sigmoid to output_image.
         if prediction.ndim == 4:
-            prediction = prediction[0, 0]
-        elif prediction.ndim == 3:
             prediction = prediction[0]
+        if prediction.ndim == 3:
+            prediction = prediction[0]
+        if prediction.ndim != 2:
+            raise RuntimeError(
+                f"Unexpected BiRefNet output shape: {tuple(prediction.shape)}"
+            )
+
         prediction = _sigmoid(prediction)
         prediction = np.clip(prediction, 0.0, 1.0)
 
-        mask = Image.fromarray((prediction * 255.0).astype(np.uint8), mode="L")
-        mask = mask.resize(original_size, Image.Resampling.BILINEAR)
+        mask = Image.fromarray(
+            (prediction * 255.0).astype(np.uint8),
+            mode="L",
+        ).resize(original_size, Image.Resampling.BILINEAR)
 
         cutout = original.convert("RGBA")
         cutout.putalpha(mask)
@@ -255,7 +332,8 @@ def root() -> dict[str, object]:
         "status": "online",
         "background_modes": ["transparent", "white", "color"],
         "requires_api_key": False,
-        "model": "BiRefNet FP16 1024",
+        "model": _active_model or "BiRefNet auto (FP16/CUDA or FP32/CPU)",
+        "input_size": "1024x1024",
     }
 
 
@@ -287,9 +365,12 @@ def remove_bg(
         return error_response("Invalid image file", 400)
     try:
         result = remove_background(image_bytes, background, background_color)
-    except Exception:
+    except Exception as exc:
         LOGGER.exception("Background removal failed")
-        return error_response("Background removal failed", 502)
+        return error_response(
+            f"Background removal failed: {type(exc).__name__}: {exc}",
+            502,
+        )
     return Response(
         content=result,
         media_type="image/png",
