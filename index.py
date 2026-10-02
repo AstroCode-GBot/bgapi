@@ -21,13 +21,24 @@ MAX_UPLOAD_BYTES: Final[int] = int(os.getenv("MAX_UPLOAD_BYTES", str(4 * 1024 * 
 ALLOWED_MIME_TYPES: Final[set[str]] = {"image/jpeg", "image/png", "image/webp"}
 ALLOWED_PIL_FORMATS: Final[set[str]] = {"JPEG", "PNG", "WEBP"}
 HEX_COLOR_RE: Final[re.Pattern[str]] = re.compile(r"^#[0-9a-fA-F]{6}$")
-MODEL_PATH: Final[Path] = Path(__file__).parent / "models" / "u2netp.onnx"
+MODEL_FILENAME: Final[str] = "model_fp16.onnx"
+MODEL_URL: Final[str] = os.getenv(
+    "MODEL_URL",
+    "https://huggingface.co/onnx-community/BiRefNet-ONNX/resolve/main/onnx/model_fp16.onnx?download=true",
+)
+# Use MODEL_DIR when a persistent disk is available (for example on Render).
+# On serverless platforms, /tmp is the writable cache directory.
+DEFAULT_MODEL_DIR = Path(os.getenv("MODEL_DIR", "/tmp/background-remover-models"))
+MODEL_PATH: Final[Path] = DEFAULT_MODEL_DIR / MODEL_FILENAME
+MODEL_SIZE_BYTES: Final[int] = 490 * 1024 * 1024
+MODEL_INPUT_SIZE: Final[tuple[int, int]] = (1024, 1024)
 _session: ort.InferenceSession | None = None
+_model_lock = __import__("threading").Lock()
 
 app = FastAPI(
     title="Background Remover API",
-    version="1.3.0",
-    description="Remove an image background locally and return a transparent, white, or custom-color PNG.",
+    version="2.0.0",
+    description="BiRefNet FP16 background removal API with automatic model download and caching.",
 )
 
 
@@ -80,28 +91,113 @@ def apply_background(image: Image.Image, mode: str, color: str) -> bytes:
     return output.getvalue()
 
 
-def remove_background(image_bytes: bytes, mode: str, color: str) -> bytes:
+def ensure_model() -> Path:
+    """Download the BiRefNet FP16 ONNX model once if it is not cached."""
+    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    if MODEL_PATH.is_file() and MODEL_PATH.stat().st_size > 400 * 1024 * 1024:
+        return MODEL_PATH
+
+    temp_path = MODEL_PATH.with_suffix(".download")
+    if temp_path.exists():
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+
+    LOGGER.info("Downloading BiRefNet FP16 model from Hugging Face...")
+    request = urllib.request.Request(
+        MODEL_URL,
+        headers={"User-Agent": "background-remover-api/2.0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response, temp_path.open("wb") as output:
+            total = int(response.headers.get("Content-Length", "0") or 0)
+            downloaded = 0
+            while True:
+                chunk = response.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+                downloaded += len(chunk)
+                if total and downloaded % (64 * 1024 * 1024) < len(chunk):
+                    LOGGER.info("BiRefNet download: %.0f%%", downloaded * 100 / total)
+        if downloaded < 400 * 1024 * 1024:
+            raise RuntimeError(f"Downloaded model is unexpectedly small: {downloaded} bytes")
+        temp_path.replace(MODEL_PATH)
+    except Exception:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+    return MODEL_PATH
+
+
+def get_session() -> ort.InferenceSession:
     global _session
+    if _session is not None:
+        return _session
+    with _model_lock:
+        if _session is not None:
+            return _session
+        model_path = ensure_model()
+        LOGGER.info("Loading BiRefNet ONNX model: %s", model_path)
+        _session = ort.InferenceSession(
+            str(model_path),
+            providers=["CPUExecutionProvider"],
+        )
+        LOGGER.info(
+            "BiRefNet loaded. input=%s output=%s",
+            [(x.name, x.shape, x.type) for x in _session.get_inputs()],
+            [(x.name, x.shape, x.type) for x in _session.get_outputs()],
+        )
+    return _session
+
+
+def _sigmoid(values: np.ndarray) -> np.ndarray:
+    values = np.clip(values.astype(np.float32), -80.0, 80.0)
+    return 1.0 / (1.0 + np.exp(-values))
+
+
+def remove_background(image_bytes: bytes, mode: str, color: str) -> bytes:
+    session = get_session()
     with Image.open(io.BytesIO(image_bytes)) as source:
         original = source.convert("RGB")
         original_size = original.size
-        resized = original.resize((320, 320), Image.Resampling.LANCZOS)
+
+        # BiRefNet official processor: resize to 1024x1024 and ImageNet normalization.
+        resized = original.resize(MODEL_INPUT_SIZE, Image.Resampling.BILINEAR)
         pixels = np.asarray(resized, dtype=np.float32) / 255.0
-        pixels = (pixels - np.array([0.485, 0.456, 0.406], dtype=np.float32)) / np.array(
-            [0.229, 0.224, 0.225], dtype=np.float32
-        )
-        tensor = np.transpose(pixels, (2, 0, 1))[None, ...].astype(np.float32)
-        if _session is None:
-            if not MODEL_PATH.is_file():
-                raise RuntimeError("Bundled background-removal model is missing")
-            _session = ort.InferenceSession(str(MODEL_PATH), providers=["CPUExecutionProvider"])
-        prediction = _session.run(None, {_session.get_inputs()[0].name: tensor})[0][:, 0, :, :]
-        prediction = np.squeeze(prediction)
-        prediction = (prediction - prediction.min()) / max(
-            float(prediction.max() - prediction.min()), 1e-6
-        )
-        mask = Image.fromarray((prediction * 255).astype(np.uint8), mode="L")
-        mask = mask.resize(original_size, Image.Resampling.LANCZOS)
+        pixels = (
+            pixels - np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        ) / np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        tensor = np.transpose(pixels, (2, 0, 1))[None, ...]
+
+        input_meta = session.get_inputs()[0]
+        input_name = input_meta.name
+        # The FP16 export can accept float16; use the graph's declared input type.
+        if "float16" in input_meta.type.lower():
+            tensor = tensor.astype(np.float16)
+        else:
+            tensor = tensor.astype(np.float32)
+
+        output_meta = session.get_outputs()[0]
+        prediction = session.run([output_meta.name], {input_name: tensor})[0]
+        prediction = np.asarray(prediction)
+
+        # Official BiRefNet ONNX usage applies sigmoid to output_image.
+        if prediction.ndim == 4:
+            prediction = prediction[0, 0]
+        elif prediction.ndim == 3:
+            prediction = prediction[0]
+        prediction = _sigmoid(prediction)
+        prediction = np.clip(prediction, 0.0, 1.0)
+
+        mask = Image.fromarray((prediction * 255.0).astype(np.uint8), mode="L")
+        mask = mask.resize(original_size, Image.Resampling.BILINEAR)
+
         cutout = original.convert("RGBA")
         cutout.putalpha(mask)
         return apply_background(cutout, mode, color)
@@ -155,10 +251,11 @@ def root() -> dict[str, object]:
     return {
         "success": True,
         "name": "Background Remover API",
-        "version": "1.3.0",
+        "version": "2.0.0",
         "status": "online",
         "background_modes": ["transparent", "white", "color"],
         "requires_api_key": False,
+        "model": "BiRefNet FP16 1024",
     }
 
 
